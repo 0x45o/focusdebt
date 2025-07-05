@@ -20,45 +20,22 @@ pub struct Config {
     #[serde(default)]
     pub ignored_apps: Vec<String>,
     
+    #[serde(default)]
+    pub focus_sites: Vec<String>,
+    
+    #[serde(default)]
+    pub ignored_sites: Vec<String>,
+    
     #[serde(default = "default_database_path")]
     pub database_path: Option<String>,
     
-    #[serde(default = "default_log_level")]
-    pub log_level: String,
+
     
-    #[serde(default)]
-    pub notifications: NotificationConfig,
-    
-    #[serde(default)]
-    pub export: ExportConfig,
+    #[serde(default = "default_first_run")]
+    pub first_run: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationConfig {
-    #[serde(default = "default_notifications_enabled")]
-    pub enabled: bool,
-    
-    #[serde(default = "default_notification_interval")]
-    pub interval_minutes: u64,
-    
-    #[serde(default)]
-    pub focus_reminders: bool,
-    
-    #[serde(default)]
-    pub break_reminders: bool,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportConfig {
-    #[serde(default)]
-    pub auto_export: bool,
-    
-    #[serde(default = "default_export_format")]
-    pub format: String,
-    
-    #[serde(default)]
-    pub export_path: Option<String>,
-}
 
 impl Default for Config {
     fn default() -> Self {
@@ -68,42 +45,22 @@ impl Default for Config {
             deep_focus_threshold_minutes: default_deep_focus_threshold(),
             focus_apps: Vec::new(),
             ignored_apps: Vec::new(),
+            focus_sites: Vec::new(),
+            ignored_sites: Vec::new(),
             database_path: default_database_path(),
-            log_level: default_log_level(),
-            notifications: NotificationConfig::default(),
-            export: ExportConfig::default(),
+
+            first_run: default_first_run(),
         }
     }
 }
 
-impl Default for NotificationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_notifications_enabled(),
-            interval_minutes: default_notification_interval(),
-            focus_reminders: false,
-            break_reminders: false,
-        }
-    }
-}
 
-impl Default for ExportConfig {
-    fn default() -> Self {
-        Self {
-            auto_export: false,
-            format: default_export_format(),
-            export_path: None,
-        }
-    }
-}
 
 fn default_tracking_interval() -> u64 { 1000 }
 fn default_save_interval() -> u64 { 30000 }
 fn default_deep_focus_threshold() -> u64 { 30 }
-fn default_notifications_enabled() -> bool { false }
-fn default_notification_interval() -> u64 { 60 }
-fn default_log_level() -> String { "info".to_string() }
-fn default_export_format() -> String { "json".to_string() }
+
+fn default_first_run() -> bool { true }
 
 fn default_database_path() -> Option<String> {
     Some("focusdebt.db".to_string())
@@ -184,14 +141,36 @@ impl Config {
         }
     }
 
-    pub fn get_export_path(&self) -> PathBuf {
-        if let Some(ref path) = self.export.export_path {
-            PathBuf::from(path)
-        } else {
-            // Default export location
-            dirs::document_dir()
-                .map(|dir| dir.join("focusdebt_exports"))
-                .unwrap_or_else(|| PathBuf::from("exports"))
+    pub fn mark_first_run_complete(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.first_run = false;
+        self.save()
+    }
+
+    pub fn add_focus_site(&mut self, site: String) {
+        if !self.focus_sites.contains(&site) {
+            self.focus_sites.push(site);
         }
+    }
+
+    pub fn remove_focus_site(&mut self, site: &str) {
+        self.focus_sites.retain(|s| s != site);
+    }
+
+    pub fn add_ignored_site(&mut self, site: String) {
+        if !self.ignored_sites.contains(&site) {
+            self.ignored_sites.push(site);
+        }
+    }
+
+    pub fn remove_ignored_site(&mut self, site: &str) {
+        self.ignored_sites.retain(|s| s != site);
+    }
+
+    pub fn is_focus_site(&self, site: &str) -> bool {
+        self.focus_sites.contains(&site.to_string())
+    }
+
+    pub fn is_ignored_site(&self, site: &str) -> bool {
+        self.ignored_sites.contains(&site.to_string())
     }
 } 

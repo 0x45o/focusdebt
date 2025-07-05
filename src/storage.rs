@@ -1,5 +1,4 @@
 use rusqlite::{Connection, Result as SqliteResult, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 use std::path::PathBuf;
@@ -24,11 +23,25 @@ impl Database {
                 end_time TEXT,
                 app_name TEXT NOT NULL,
                 window_title TEXT NOT NULL,
+                domain TEXT,
                 duration_seconds INTEGER NOT NULL,
-                is_focus_app BOOLEAN NOT NULL
+                is_focus_app BOOLEAN NOT NULL,
+                session_name TEXT NOT NULL DEFAULT ''
             )",
             [],
         )?;
+
+        // Add session_name column if it doesn't exist (for existing databases)
+        let _ = conn.execute(
+            "ALTER TABLE focus_sessions ADD COLUMN session_name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
+        // Add domain column if it doesn't exist (for existing databases)
+        let _ = conn.execute(
+            "ALTER TABLE focus_sessions ADD COLUMN domain TEXT",
+            [],
+        );
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS context_switches (
@@ -50,31 +63,42 @@ impl Database {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS focus_sites (
+                id INTEGER PRIMARY KEY,
+                domain TEXT UNIQUE NOT NULL,
+                added_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
         Ok(Database { conn })
     }
 
     fn get_db_path() -> SqliteResult<PathBuf> {
         let data_dir = dirs::data_dir()
-            .ok_or_else(|| rusqlite::Error::InvalidPath("Could not find data directory".into()))?;
+            .ok_or_else(|| rusqlite::Error::InvalidPath("❌ Could not find data directory".into()))?;
         
         let focusdebt_dir = data_dir.join("focusdebt");
         std::fs::create_dir_all(&focusdebt_dir)
-            .map_err(|e| rusqlite::Error::InvalidPath(format!("Failed to create directory: {}", e).into()))?;
+            .map_err(|e| rusqlite::Error::InvalidPath(format!("❌ Failed to create directory: {}", e).into()))?;
         
         Ok(focusdebt_dir.join("focusdebt.db"))
     }
 
     pub fn save_focus_session(&self, session: &FocusSession) -> SqliteResult<()> {
         self.conn.execute(
-            "INSERT INTO focus_sessions (start_time, end_time, app_name, window_title, duration_seconds, is_focus_app)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO focus_sessions (start_time, end_time, app_name, window_title, domain, duration_seconds, is_focus_app, session_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             (
                 &session.start_time.to_rfc3339(),
                 &session.end_time.as_ref().map(|t| t.to_rfc3339()),
                 &session.app_name,
                 &session.window_title,
+                &session.domain,
                 session.duration.as_secs() as i64,
                 session.is_focus_app,
+                &session.session_name,
             ),
         )?;
         Ok(())
@@ -123,6 +147,35 @@ impl Database {
         Ok(apps)
     }
 
+    pub fn add_focus_site(&self, domain: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO focus_sites (domain, added_at) VALUES (?1, ?2)",
+            (domain, &Utc::now().to_rfc3339()),
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_focus_site(&self, domain: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "DELETE FROM focus_sites WHERE domain = ?1",
+            (domain,),
+        )?;
+        Ok(())
+    }
+
+    pub fn get_focus_sites(&self) -> SqliteResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT domain FROM focus_sites ORDER BY domain")?;
+        let site_iter = stmt.query_map([], |row| {
+            Ok(row.get(0)?)
+        })?;
+
+        let mut sites = Vec::new();
+        for site in site_iter {
+            sites.push(site?);
+        }
+        Ok(sites)
+    }
+
     pub fn get_deep_focus_sessions(&self, min_duration_seconds: u64, date: DateTime<Utc>) -> SqliteResult<Vec<FocusSession>> {
         let start_of_day = date.date_naive().and_hms_opt(0, 0, 0).unwrap();
         let end_of_day = date.date_naive().and_hms_opt(23, 59, 59).unwrap();
@@ -132,7 +185,7 @@ impl Database {
         let min_duration_str = (min_duration_seconds as i64).to_string();
 
         let mut stmt = self.conn.prepare(
-            "SELECT start_time, end_time, app_name, window_title, duration_seconds, is_focus_app
+            "SELECT start_time, end_time, app_name, window_title, domain, duration_seconds, is_focus_app, session_name
              FROM focus_sessions 
              WHERE start_time >= ?1 AND start_time <= ?2 
              AND is_focus_app = 1 
@@ -145,8 +198,10 @@ impl Database {
             let end_time: Option<String> = row.get(1)?;
             let app_name: String = row.get(2)?;
             let window_title: String = row.get(3)?;
-            let duration_seconds: i64 = row.get(4)?;
-            let is_focus_app: bool = row.get(5)?;
+            let domain: Option<String> = row.get(4)?;
+            let duration_seconds: i64 = row.get(5)?;
+            let is_focus_app: bool = row.get(6)?;
+            let session_name: String = row.get(7)?;
 
             let start_time = DateTime::parse_from_rfc3339(&start_time)
                 .map_err(|_| rusqlite::Error::InvalidParameterName("Invalid start_time".into()))?
@@ -163,8 +218,10 @@ impl Database {
                 end_time,
                 app_name,
                 window_title,
+                domain,
                 duration: Duration::from_secs(duration_seconds as u64),
                 is_focus_app,
+                session_name,
             })
         })?;
 
@@ -173,27 +230,6 @@ impl Database {
             sessions.push(session?);
         }
         Ok(sessions)
-    }
-
-    pub fn get_average_recovery_time(&self, date: DateTime<Utc>) -> SqliteResult<Option<Duration>> {
-        let start_of_day = date.date_naive().and_hms_opt(0, 0, 0).unwrap();
-        let end_of_day = date.date_naive().and_hms_opt(23, 59, 59).unwrap();
-        
-        let start_str = DateTime::<Utc>::from_naive_utc_and_offset(start_of_day, Utc).to_rfc3339();
-        let end_str = DateTime::<Utc>::from_naive_utc_and_offset(end_of_day, Utc).to_rfc3339();
-
-        let mut stmt = self.conn.prepare(
-            "SELECT AVG(recovery_time_seconds) 
-             FROM context_switches 
-             WHERE timestamp >= ?1 AND timestamp <= ?2 
-             AND recovery_time_seconds IS NOT NULL"
-        )?;
-
-        let result: Option<i64> = stmt.query_row([&start_str, &end_str], |row| {
-            Ok(row.get(0)?)
-        }).optional()?;
-
-        Ok(result.map(|seconds| Duration::from_secs(seconds as u64)))
     }
 
     pub fn get_most_distracting_apps(&self, date: DateTime<Utc>, limit: usize) -> SqliteResult<Vec<(String, Duration)>> {
@@ -235,7 +271,7 @@ impl Database {
         let end_str = DateTime::<Utc>::from_naive_utc_and_offset(end_of_day, Utc).to_rfc3339();
 
         let mut stmt = self.conn.prepare(
-            "SELECT start_time, end_time, app_name, window_title, duration_seconds, is_focus_app
+            "SELECT start_time, end_time, app_name, window_title, domain, duration_seconds, is_focus_app, session_name
              FROM focus_sessions 
              WHERE start_time >= ?1 AND start_time <= ?2
              ORDER BY start_time"
@@ -246,8 +282,10 @@ impl Database {
             let end_time: Option<String> = row.get(1)?;
             let app_name: String = row.get(2)?;
             let window_title: String = row.get(3)?;
-            let duration_seconds: i64 = row.get(4)?;
-            let is_focus_app: bool = row.get(5)?;
+            let domain: Option<String> = row.get(4)?;
+            let duration_seconds: i64 = row.get(5)?;
+            let is_focus_app: bool = row.get(6)?;
+            let session_name: String = row.get(7)?;
 
             let start_time = DateTime::parse_from_rfc3339(&start_time)
                 .map_err(|_| rusqlite::Error::InvalidParameterName("Invalid start_time".into()))?
@@ -264,8 +302,10 @@ impl Database {
                 end_time,
                 app_name,
                 window_title,
+                domain,
                 duration: Duration::from_secs(duration_seconds as u64),
                 is_focus_app,
+                session_name,
             })
         })?;
 
@@ -315,5 +355,71 @@ impl Database {
             switches.push(switch?);
         }
         Ok(switches)
+    }
+
+    pub fn get_most_recent_session_name(&self) -> SqliteResult<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_name 
+             FROM focus_sessions 
+             WHERE session_name != '' 
+             ORDER BY start_time DESC 
+             LIMIT 1"
+        )?;
+
+        let result: Option<String> = stmt.query_row([], |row| {
+            let session_name: String = row.get(0)?;
+            Ok(session_name)
+        }).optional()?;
+
+        Ok(result)
+    }
+
+    pub fn session_name_exists(&self, session_name: &str) -> SqliteResult<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*) 
+             FROM focus_sessions 
+             WHERE session_name = ?1"
+        )?;
+
+        let count: i64 = stmt.query_row([session_name], |row| {
+            row.get(0)
+        })?;
+
+        Ok(count > 0)
+    }
+
+    // Database cleanup and maintenance methods
+    pub fn clear_all_data(&self) -> SqliteResult<()> {
+        self.conn.execute("DELETE FROM focus_sessions", [])?;
+        self.conn.execute("DELETE FROM context_switches", [])?;
+        self.conn.execute("DELETE FROM focus_apps", [])?;
+        println!("~=~ All data cleared from database");
+        Ok(())
+    }
+
+    pub fn clear_invalid_sessions(&self) -> SqliteResult<usize> {
+        // Remove sessions with invalid durations (likely from broken tracking)
+        let invalid_sessions = self.conn.execute(
+            "DELETE FROM focus_sessions WHERE duration_seconds > 86400 OR duration_seconds < 1",
+            []
+        )?;
+        
+        // Remove sessions without proper end times
+        let incomplete_sessions = self.conn.execute(
+            "DELETE FROM focus_sessions WHERE end_time IS NULL",
+            []
+        )?;
+        
+        let total_deleted = invalid_sessions + incomplete_sessions;
+        if total_deleted > 0 {
+            println!("~=~ Cleaned up {} invalid sessions", total_deleted);
+        }
+        Ok(total_deleted)
+    }
+
+    pub fn vacuum_database(&self) -> SqliteResult<()> {
+        self.conn.execute("VACUUM", [])?;
+        println!("~=~ Database vacuumed and optimized");
+        Ok(())
     }
 } 
